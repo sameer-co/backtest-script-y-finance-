@@ -23,7 +23,7 @@ CONFIG = {
     "TARGET_RR": 2.5,
     "ATR_TRAIL_MULT": 2.0,
     "BACKTEST_PERIOD": "2y",
-    "WATCHLIST_FILE": "backtest_list.txt",
+    "WATCHLIST_FILE": "backtest.txt",
     "TEST_TIMEFRAMES": ["1h", "4h", "1d"], # ADD/REMOVE TIMEFRAMES HERE
     "DELAY_SECONDS": 5 
 }
