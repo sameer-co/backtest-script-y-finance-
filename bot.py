@@ -7,7 +7,7 @@ import time
 
 # --- CUSTOMIZABLE PARAMETERS (Modify these as needed) ---
 CONFIG = {
-    "TOKEN": "8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE",
+    "TOKEN": "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg",
     "CHAT_ID": "1950462171",
     "INITIAL_CASH": 50000,
     "RISK_PERCENT": 0.02,     # 2% Risk per trade
