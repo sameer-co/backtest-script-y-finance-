@@ -24,10 +24,10 @@ CONFIG = {
     "ATR_TRAIL_MULT": 2.0,
     "BACKTEST_PERIOD": "2y",
     "WATCHLIST_FILE": "backtest_list.txt",
-    "DELAY_SECONDS": 5  # Added for rate limiting
+    "TEST_TIMEFRAMES": ["1h", "4h", "1d"], # ADD/REMOVE TIMEFRAMES HERE
+    "DELAY_SECONDS": 5 
 }
 
-# --- STRATEGY ENGINE ---
 class AdvancedRSIStrategy(bt.Strategy):
     params = (
         ('rsi_p', CONFIG["RSI_PERIOD"]),
@@ -77,81 +77,75 @@ class AdvancedRSIStrategy(bt.Strategy):
             if self.data.low[0] <= self.stop_loss:
                 self.close()
 
-# --- UTILS ---
 def send_msg(text):
     url = f"https://api.telegram.org/bot{CONFIG['TOKEN']}/sendMessage"
     payload = {"chat_id": CONFIG["CHAT_ID"], "text": text, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+    try: requests.post(url, json=payload, timeout=10)
+    except: pass
 
-# --- MAIN RUNNER ---
+def resample_data(df, timeframe):
+    if timeframe == "1h": return df
+    logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+    tf_map = {"1d": "D", "4h": "4h", "2h": "2h"}
+    return df.resample(tf_map.get(timeframe, timeframe)).apply(logic).dropna()
+
 if __name__ == "__main__":
     if not os.path.exists(CONFIG["WATCHLIST_FILE"]):
-        print("Watchlist file missing.")
+        print(f"Error: {CONFIG['WATCHLIST_FILE']} not found!")
         exit()
 
     with open(CONFIG["WATCHLIST_FILE"], "r") as f:
         symbols = [s.strip().upper() for s in f.read().splitlines() if s.strip()]
 
     total_portfolio_pl = 0
-    symbols_tested = 0
 
     for s in symbols:
         ticker = s if "." in s else f"{s}.NS"
-        print(f"⌛ Testing {ticker}...")
+        print(f"📥 Downloading 2y hourly data for {ticker}...")
         
-        df = yf.download(ticker, period=CONFIG["BACKTEST_PERIOD"], interval="1d", progress=False)
-        if df.empty: continue
+        # Download 1h as base (highest resolution for 2y)
+        raw_df = yf.download(ticker, period="2y", interval="1h", progress=False)
+        if raw_df.empty: continue
 
-        # DATA FIX FOR BACKTRADER
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(col) for col in df.columns]
-        df = df.dropna()
+        # Fix Multi-index Columns
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            raw_df.columns = raw_df.columns.get_level_values(0)
+        raw_df.columns = [str(col) for col in raw_df.columns]
 
-        cerebro = bt.Cerebro()
-        data_feed = bt.feeds.PandasData(dataname=df)
-        cerebro.adddata(data_feed, name=ticker)
-        cerebro.addstrategy(AdvancedRSIStrategy)
-        cerebro.broker.setcash(CONFIG["INITIAL_CASH"])
-        
-        cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="tr")
-        cerebro.addanalyzer(bt.analyzers.DrawDown, _name="dd")
+        for tf in CONFIG["TEST_TIMEFRAMES"]:
+            print(f"⌛ Testing {ticker} on {tf}...")
+            df = resample_data(raw_df.copy(), tf)
+            
+            cerebro = bt.Cerebro()
+            cerebro.adddata(bt.feeds.PandasData(dataname=df), name=f"{ticker}_{tf}")
+            cerebro.addstrategy(AdvancedRSIStrategy)
+            cerebro.broker.setcash(CONFIG["INITIAL_CASH"])
+            
+            cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="tr")
+            cerebro.addanalyzer(bt.analyzers.DrawDown, _name="dd")
 
-        try:
-            results = cerebro.run()
-            res = results[0].analyzers.tr.get_analysis()
-            drawdown = results[0].analyzers.dd.get_analysis()
+            try:
+                results = cerebro.run()
+                res = results[0].analyzers.tr.get_analysis()
+                dd = results[0].analyzers.dd.get_analysis()
 
-            if 'total' in res and res.total.total > 0:
-                net_profit = cerebro.broker.get_value() - CONFIG["INITIAL_CASH"]
-                total_portfolio_pl += net_profit
-                symbols_tested += 1
-                
-                summary = (
-                    f"📈 *Result: {ticker}*\n"
-                    f"Total Trades: {res.total.total}\n"
-                    f"✅ Won: {res.won.total if 'won' in res else 0}\n"
-                    f"🔥 Max DD: {drawdown.max.drawdown:.2f}%\n"
-                    f"💰 Net P/L: ₹{net_profit:.2f}"
-                )
-                send_msg(summary)
-                print(f"✅ Result sent for {ticker}. Waiting 5s...")
-                time.sleep(CONFIG["DELAY_SECONDS"]) # Rate limiting delay
-            else:
-                print(f"ℹ️ No trades for {ticker}")
-                
-        except Exception as e:
-            print(f"❌ Error testing {ticker}: {e}")
+                if 'total' in res and res.total.total > 0:
+                    net_profit = cerebro.broker.get_value() - CONFIG["INITIAL_CASH"]
+                    total_portfolio_pl += net_profit
+                    
+                    summary = (
+                        f"📊 *Backtest: {ticker}*\n"
+                        f"🕒 *Timeframe:* `{tf}`\n"
+                        f"Trades: {res.total.total} | Wins: {res.won.total if 'won' in res else 0}\n"
+                        f"🔥 Max DD: {dd.max.drawdown:.2f}%\n"
+                        f"💰 Net P/L: ₹{net_profit:.2f}"
+                    )
+                    send_msg(summary)
+                    print(f"✅ Sent {tf} result. Sleeping {CONFIG['DELAY_SECONDS']}s...")
+                    time.sleep(CONFIG["DELAY_SECONDS"])
+            except Exception as e:
+                print(f"Error on {ticker} {tf}: {e}")
 
-    # FINAL TOTAL UPDATE
-    final_message = (
-        f"🏁 *COMPLETED ALL BACKTESTS*\n\n"
-        f"Total Symbols Tested: {symbols_tested}\n"
-        f"💼 *Total Portfolio P/L:* ₹{total_portfolio_pl:.2f}\n"
-        f"Initial Capital per stock: ₹{CONFIG['INITIAL_CASH']}"
-    )
-    send_msg(final_message)
-    print("🚀 All tasks complete. Final report sent.")
+    # FINAL TOTAL
+    send_msg(f"🏁 *BACKTEST COMPLETE*\n\n💼 *Total Portfolio P/L:* ₹{total_portfolio_pl:.2f}")
+    print("All tests finished.")
