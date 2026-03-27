@@ -4,8 +4,14 @@ import pandas as pd
 import os
 import requests
 import time
+import collections
 
-# --- CUSTOMIZABLE PARAMETERS (Modify these as needed) ---
+# Compatibility Patch for Python 3.10+ (fixes 'Iterable' error in backtrader)
+if not hasattr(collections, 'Iterable'):
+    import collections.abc
+    collections.Iterable = collections.abc.Iterable
+
+# --- CUSTOMIZABLE PARAMETERS ---
 CONFIG = {
     "TOKEN": "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg",
     "CHAT_ID": "1950462171",
@@ -68,7 +74,7 @@ class AdvancedRSIStrategy(bt.Strategy):
             if not self.half_booked and self.data.high[0] >= self.target:
                 self.sell(size=int(self.position.size / 2))
                 self.half_booked = True
-                # Move Stop to Breakeven once target hit (optional, but safer)
+                # Initial trail: Move Stop to entry/breakeven once half is booked
                 self.stop_loss = max(self.stop_loss, self.data.open[0])
 
             # Trailing Stop: ACTIVATES ONLY AFTER 50% IS BOOKED
@@ -85,13 +91,13 @@ class AdvancedRSIStrategy(bt.Strategy):
 def send_msg(text):
     url = f"https://api.telegram.org/bot{CONFIG['TOKEN']}/sendMessage"
     payload = {"chat_id": CONFIG["CHAT_ID"], "text": text, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload, timeout=10)
-    except: pass
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Telegram Error: {e}")
 
-# --- SAMPLE WATCHLIST CREATOR ---
 def create_sample_watchlist():
     if not os.path.exists(CONFIG["WATCHLIST_FILE"]):
-        # Top NSE symbols for backtesting
         samples = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "BHARTIARTL.NS"]
         with open(CONFIG["WATCHLIST_FILE"], "w") as f:
             f.write("\n".join(samples))
@@ -99,9 +105,12 @@ def create_sample_watchlist():
 
 # --- MAIN RUNNER ---
 if __name__ == "__main__":
-    import requests # Imported here for scope
     create_sample_watchlist()
     
+    if not os.path.exists(CONFIG["WATCHLIST_FILE"]):
+        print("No watchlist found.")
+        exit()
+
     with open(CONFIG["WATCHLIST_FILE"], "r") as f:
         symbols = [s.strip().upper() for s in f.read().splitlines() if s.strip()]
 
@@ -109,33 +118,62 @@ if __name__ == "__main__":
         ticker = s if "." in s else f"{s}.NS"
         print(f"⌛ Testing {ticker}...")
         
+        # Download Data
         df = yf.download(ticker, period=CONFIG["BACKTEST_PERIOD"], interval="1d", progress=False)
-        if df.empty: continue
+        
+        if df.empty:
+            print(f"⚠️ No data for {ticker}")
+            continue
 
+        # --- DATA CLEANING FOR BACKTRADER (THE FIX) ---
+        # 1. Flatten Multi-Index columns if they exist
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        # 2. Ensure column names are plain strings
+        df.columns = [str(col) for col in df.columns]
+        
+        # 3. Drop any NaN rows to prevent calculation errors
+        df = df.dropna()
+
+        # Run Cerebro
         cerebro = bt.Cerebro()
-        cerebro.adddata(bt.feeds.PandasData(dataname=df), name=ticker)
+        # Ensure PandasData gets the cleaned dataframe
+        data_feed = bt.feeds.PandasData(dataname=df)
+        cerebro.adddata(data_feed, name=ticker)
+        
         cerebro.addstrategy(AdvancedRSIStrategy)
         cerebro.broker.setcash(CONFIG["INITIAL_CASH"])
+        
+        # Analyzers
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="tr")
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name="dd")
 
-        results = cerebro.run()
-        res = results[0].analyzers.tr.get_analysis()
-        drawdown = results[0].analyzers.dd.get_analysis()
+        try:
+            results = cerebro.run()
+            strat = results[0]
+            res = strat.analyzers.tr.get_analysis()
+            drawdown = strat.analyzers.dd.get_analysis()
 
-        if 'total' in res and res.total.total > 0:
-            total = res.total.total
-            won = res.won.total if 'won' in res else 0
-            lost = res.lost.total if 'lost' in res else 0
-            net_profit = cerebro.broker.get_value() - CONFIG["INITIAL_CASH"]
+            if 'total' in res and res.total.total > 0:
+                total = res.total.total
+                won = res.won.total if 'won' in res else 0
+                lost = res.lost.total if 'lost' in res else 0
+                net_profit = cerebro.broker.get_value() - CONFIG["INITIAL_CASH"]
+                
+                summary = (
+                    f"📈 *Result: {ticker}*\n"
+                    f"Total Trades: {total}\n"
+                    f"✅ Wins: {won} | ❌ Loss: {lost}\n"
+                    f"🔥 Max Drawdown: {drawdown.max.drawdown:.2f}%\n"
+                    f"💰 Net P/L: ₹{net_profit:.2f}\n"
+                    f"Account: ₹{cerebro.broker.get_value():.2f}"
+                )
+                send_msg(summary)
+            else:
+                print(f"ℹ️ No trades executed for {ticker}")
+                
+        except Exception as e:
+            print(f"❌ Error testing {ticker}: {e}")
             
-            summary = (
-                f"📈 *Result: {ticker}*\n"
-                f"Total Trades: {total}\n"
-                f"✅ Wins: {won} | ❌ Loss: {lost}\n"
-                f"🔥 Max Drawdown: {drawdown.max.drawdown:.2f}%\n"
-                f"💰 Net P/L: ₹{net_profit:.2f}\n"
-                f"Account: ₹{cerebro.broker.get_value():.2f}"
-            )
-            send_msg(summary)
-            time.sleep(1)
+        time.sleep(1)
