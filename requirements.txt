@@ -1,0 +1,6 @@
+yfinance
+pandas
+pandas_ta
+backtrader
+requests
+pytz
