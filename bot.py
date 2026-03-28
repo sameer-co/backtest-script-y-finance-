@@ -18,7 +18,7 @@ CONFIG = {
     "INITIAL_CASH": 50000,
     "RISK_PERCENT": 0.02,
     "BACKTEST_PERIOD": "2y",
-    "WATCHLIST_FILE": "backtest_list.txt",
+    "WATCHLIST_FILE": "watchlist.txt",
     "TEST_TIMEFRAMES": ["2h","3h", "4h", "1d"],
     "DELAY_SECONDS": 5 
 }
