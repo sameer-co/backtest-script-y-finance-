@@ -19,7 +19,7 @@ CONFIG = {
     "RISK_PERCENT": 0.02,
     "BACKTEST_PERIOD": "2y",
     "WATCHLIST_FILE": "watchlist.txt",
-    "TEST_TIMEFRAMES": ["1h", "4h", "1d"],
+    "TEST_TIMEFRAMES": ["2h", "4h"],
     "DELAY_SECONDS": 5 
 }
 
