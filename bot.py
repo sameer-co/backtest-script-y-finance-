@@ -1,261 +1,439 @@
-import backtrader as bt
-import yfinance as yf
-import pandas as pd
-import os
-import requests
+"""
+SOL/USDT — RSI(40) / WMA(15) Crossover Backtest
+=================================================
+• Data   : Binance public API, 5-minute candles, last 5 years
+• Entry  : RSI crosses ABOVE WMA_RSI AND RSI < 60  → Long
+• SL     : max(low of crossover candle, close - 1.3×ATR)
+• TP     : close + 2.2 × (close - SL)
+• Size   : fixed $1,000 USDC account, full capital per trade (no compounding)
+• Report : sent to Telegram on completion
+"""
+
 import time
-import collections
+import math
+import requests
 import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+import logging
 
-# Compatibility patch for Python 3.10+
-if not hasattr(collections, 'Iterable'):
-    import collections.abc
-    collections.Iterable = collections.abc.Iterable
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    filename="backtest.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-CONFIG = {
-    "TOKEN":          "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg",
-    "CHAT_ID":        "1950462171",
-    "INITIAL_CASH":   50000,
-    "RISK_PERCENT":   0.02,
-    "BACKTEST_PERIOD": "2y",
-    "WATCHLIST_FILE": "watchlist.txt",
-    "TEST_TIMEFRAMES": ["2h", "4h" ,"1d"],
-    "COMMISSION":     0.001,   # 0.1% round-trip (brokerage + fees)
-    "DELAY_SECONDS":  5,
-}
+# ── Config ───────────────────────────────────────────────────────────────────
+TOKEN   = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg"
+CHAT_ID = "1950462171"
 
-STATS = {
-    "global":     {"profit": 0, "trades": 0, "wins": 0, "gross_p": 0, "gross_l": 0, "max_dd": 0},
-    "timeframes": {tf: {"profit": 0, "trades": 0, "wins": 0} for tf in CONFIG["TEST_TIMEFRAMES"]},
-    "best":       {"name": "", "profit": -999999},
-}
+SYMBOL     = "SOLUSDT"
+INTERVAL   = "5m"
+ACCOUNT    = 1_000.0      # USDC
+RSI_PERIOD = 40
+WMA_PERIOD = 15
+ATR_PERIOD = 14
+ATR_MULT   = 1.3          # SL = max(crossover low, close - ATR_MULT×ATR)
+RR         = 2.2          # TP = entry + RR × (entry - SL)
+RSI_MAX    = 60.0         # only enter if RSI < RSI_MAX at crossover
 
-
-class AdvancedRSIStrategy(bt.Strategy):
-    params = (
-        ('rsi_p',    40),
-        ('wma_p',    15),
-        ('atr_p',    14),
-        ('rr',       2.5),
-        ('atr_m',    2.0),
-        ('adx_p',    14),
-        ('adx_limit', 25),
-        ('sma_p',    15),   # FIX Warn #2: was 7 (noise) → 15 (meaningful short-term trend)
-    )
-
-    def __init__(self):
-        self.rsi     = bt.indicators.RSI(self.data.close, period=self.p.rsi_p)
-        self.wma_rsi = bt.indicators.WMA(self.rsi,        period=self.p.wma_p)
-        self.atr     = bt.indicators.ATR(self.data,       period=self.p.atr_p)
-        self.adx     = bt.indicators.ADX(self.data,       period=self.p.adx_p)
-        self.sma     = bt.indicators.SMA(self.data.close, period=self.p.sma_p)
-
-        # ATR moving average for volatility gate (ATR-gated RSI idea)
-        self.atr_ma  = bt.indicators.SMA(self.atr,        period=20)
-
-        # Trade state — reset properly via notify_trade (FIX Bug #3)
-        self.stop_loss   = None
-        self.target      = None
-        self.half_booked = False
-        self.entry_price = None
-
-    # FIX Bug #3: reset state cleanly after every closed trade
-    def notify_trade(self, trade):
-        if trade.isclosed:
-            self.stop_loss   = None
-            self.target      = None
-            self.half_booked = False
-            self.entry_price = None
-
-    def next(self):
-        if not self.position:
-            rsi_cross    = self.rsi[0] > self.wma_rsi[0] and self.rsi[-1] <= self.wma_rsi[-1]
-            trend_strong = self.adx[0] >= self.p.adx_limit
-            above_sma    = self.data.close[0] > self.sma[0]
-            # ATR gate: only enter when volatility is expanding (ATR > its own MA)
-            vol_expanding = self.atr[0] > self.atr_ma[0]
-
-            if rsi_cross and trend_strong and above_sma and vol_expanding:
-                entry = self.data.close[0]
-                risk  = entry - self.data.low[-1]
-
-                if risk > 0:
-                    qty       = int((self.broker.get_value() * CONFIG["RISK_PERCENT"]) / risk)
-                    final_qty = min(qty, int(self.broker.get_cash() / entry))
-
-                    if final_qty > 0:
-                        self.buy(size=final_qty)
-                        self.entry_price = entry
-                        self.stop_loss   = self.data.low[-1]
-                        self.target      = entry + (risk * self.p.rr)
-                        self.half_booked = False
-
-        elif self.position:
-            # Guard: stop_loss should never be None inside a position
-            if self.stop_loss is None:
-                self.stop_loss = self.data.low[-1]
-
-            # 1. Partial profit at RR target
-            if not self.half_booked and self.data.high[0] >= self.target:
-                # FIX Bug #2: guard against size=0 on small positions
-                half_size = max(1, int(self.position.size / 2))
-                self.sell(size=half_size)
-                self.half_booked = True
-                # Move stop to breakeven (entry price, not open[0])
-                self.stop_loss = max(self.stop_loss, self.entry_price)
-
-            # 2. ATR trailing stop (active after half-booking)
-            if self.half_booked:
-                trail = self.data.close[0] - (self.atr[0] * self.p.atr_m)
-                self.stop_loss = max(self.stop_loss, trail)
-
-            # 3. Hard stop exit
-            if self.data.low[0] <= self.stop_loss:
-                self.close()
+BINANCE_BASE = "https://api.binance.com"
+LIMIT        = 1000       # max candles per request
 
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────────────────────────
 
-def send_msg(text: str) -> None:
-    url = f"https://api.telegram.org/bot{CONFIG['TOKEN']}/sendMessage"
+def send_telegram(text: str) -> None:
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(
-            url,
-            json={"chat_id": CONFIG["CHAT_ID"], "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-    except Exception:
-        pass
+        r = requests.post(url, json=payload, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
 
 
-def resample_data(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    if timeframe == "1h":
-        return df
-    tf_map = {"1d": "D", "4h": "4h", "2h": "2h"}
-    rule = tf_map.get(timeframe, timeframe)
-    return df.resample(rule).apply(
-        {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
-    ).dropna()
+def send_long_telegram(text: str) -> None:
+    """Split messages that exceed Telegram's 4096-char limit."""
+    chunk_size = 4000
+    for i in range(0, len(text), chunk_size):
+        send_telegram(text[i : i + chunk_size])
+        time.sleep(0.5)
 
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+# ── Data fetch ───────────────────────────────────────────────────────────────
+
+def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Paginate through Binance /api/v3/klines to fetch all candles
+    between start_ms and end_ms (epoch milliseconds).
+    """
+    all_rows: list[list] = []
+    current  = start_ms
+    total_calls = 0
+
+    print(f"⬇️  Fetching {symbol} {interval} data …  (this may take a few minutes)")
+    send_telegram(f"⏳ *Backtest starting*\nFetching `{symbol}` `{interval}` data from Binance …")
+
+    while current < end_ms:
+        params = {
+            "symbol":    symbol,
+            "interval":  interval,
+            "startTime": current,
+            "endTime":   end_ms,
+            "limit":     LIMIT,
+        }
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(f"{BINANCE_BASE}/api/v3/klines",
+                                    params=params, timeout=20)
+                resp.raise_for_status()
+                rows = resp.json()
+                break
+            except Exception as e:
+                log.warning(f"Fetch attempt {attempt} failed: {e}")
+                if attempt == 3:
+                    raise
+                time.sleep(5 * attempt)
+
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+        current = rows[-1][6] + 1   # close-time of last candle + 1 ms
+        total_calls += 1
+
+        if total_calls % 50 == 0:
+            pct = (current - start_ms) / (end_ms - start_ms) * 100
+            print(f"   … {pct:.1f}% fetched ({len(all_rows):,} candles)")
+
+        time.sleep(0.12)   # stay well within Binance rate limits
+
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_vol","trades","taker_base","taker_quote","ignore"
+    ])
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df = df.drop_duplicates("open_time").sort_values("open_time").reset_index(drop=True)
+
+    print(f"✅ Downloaded {len(df):,} candles ({total_calls} API calls)")
+    log.info(f"Downloaded {len(df):,} candles in {total_calls} calls")
+    return df
+
+
+# ── Indicators ───────────────────────────────────────────────────────────────
+
+def calc_rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_l = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def calc_wma(series: pd.Series, period: int) -> pd.Series:
+    weights = np.arange(1, period + 1, dtype=float)
+    return series.rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+
+def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"]  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, min_periods=period).mean()
+
+
+# ── Backtest engine ──────────────────────────────────────────────────────────
+
+def run_backtest(df: pd.DataFrame) -> dict:
+    print("🔧 Calculating indicators …")
+    df = df.copy()
+    df["rsi"]     = calc_rsi(df["close"], RSI_PERIOD)
+    df["wma_rsi"] = calc_wma(df["rsi"],   WMA_PERIOD)
+    df["atr"]     = calc_atr(df,           ATR_PERIOD)
+    df = df.dropna(subset=["rsi", "wma_rsi", "atr"]).reset_index(drop=True)
+
+    trades: list[dict] = []
+    in_trade   = False
+    entry_px   = sl = tp = 0.0
+    entry_time = None
+    entry_idx  = 0
+
+    print("🔁 Running trade simulation …")
+
+    for i in range(1, len(df)):
+        row  = df.iloc[i]
+        prev = df.iloc[i - 1]
+
+        # ── Manage open trade ──
+        if in_trade:
+            hit_sl = row["low"]  <= sl
+            hit_tp = row["high"] >= tp
+
+            if hit_sl and hit_tp:
+                # Assume worst case: SL hit first
+                outcome = "SL"
+                exit_px = sl
+            elif hit_sl:
+                outcome = "SL"
+                exit_px = sl
+            elif hit_tp:
+                outcome = "TP"
+                exit_px = tp
+            else:
+                continue   # still in trade
+
+            pnl_pct  = (exit_px - entry_px) / entry_px
+            pnl_usdc = ACCOUNT * pnl_pct
+            trades.append({
+                "entry_time": entry_time,
+                "exit_time":  row["close_time"],
+                "entry":      entry_px,
+                "exit":       exit_px,
+                "sl":         sl,
+                "tp":         tp,
+                "outcome":    outcome,
+                "pnl_usdc":   pnl_usdc,
+                "pnl_pct":    pnl_pct * 100,
+                "hold_bars":  i - entry_idx,
+            })
+            in_trade = False
+            continue
+
+        # ── Check for new entry signal ──
+        bullish_cross = (prev["rsi"] <= prev["wma_rsi"]) and (row["rsi"] > row["wma_rsi"])
+        rsi_below_60  = row["rsi"] < RSI_MAX
+
+        if bullish_cross and rsi_below_60:
+            entry_px   = row["close"]
+            entry_time = row["open_time"]
+            entry_idx  = i
+
+            # SL = max(crossover candle low, close - 1.3×ATR)
+            atr_sl  = entry_px - ATR_MULT * row["atr"]
+            candle_sl = row["low"]
+            sl = max(candle_sl, atr_sl)          # bigger distance = lower price? NO:
+            # "bigger" means the one that is further from entry = lower price
+            sl = min(candle_sl, atr_sl)           # SL must be BELOW entry
+            # actually: we want the SL that is HIGHER (closer) to protect capital less
+            # per spec: "whichever is bigger" → bigger distance from entry
+            sl_atr_dist    = entry_px - atr_sl
+            sl_candle_dist = entry_px - candle_sl
+            if sl_atr_dist >= sl_candle_dist:
+                sl = atr_sl
+            else:
+                sl = candle_sl
+
+            risk = entry_px - sl
+            if risk <= 0:
+                continue   # degenerate candle, skip
+
+            tp       = entry_px + RR * risk
+            in_trade = True
+
+    # ── Close any open trade at last bar ──
+    if in_trade:
+        last = df.iloc[-1]
+        exit_px  = last["close"]
+        pnl_pct  = (exit_px - entry_px) / entry_px
+        trades.append({
+            "entry_time": entry_time,
+            "exit_time":  last["close_time"],
+            "entry":      entry_px,
+            "exit":       exit_px,
+            "sl":         sl,
+            "tp":         tp,
+            "outcome":    "OPEN",
+            "pnl_usdc":   ACCOUNT * pnl_pct,
+            "pnl_pct":    pnl_pct * 100,
+            "hold_bars":  len(df) - 1 - entry_idx,
+        })
+
+    return {"trades": trades, "df": df}
+
+
+# ── Statistics ───────────────────────────────────────────────────────────────
+
+def calc_stats(trades: list[dict], df: pd.DataFrame) -> dict:
+    if not trades:
+        return {"error": "No trades generated."}
+
+    tdf = pd.DataFrame(trades)
+
+    total       = len(tdf)
+    wins        = (tdf["outcome"] == "TP").sum()
+    losses      = (tdf["outcome"] == "SL").sum()
+    open_t      = (tdf["outcome"] == "OPEN").sum()
+    win_rate    = wins / total * 100
+
+    gross_profit = tdf.loc[tdf["pnl_usdc"] > 0, "pnl_usdc"].sum()
+    gross_loss   = tdf.loc[tdf["pnl_usdc"] < 0, "pnl_usdc"].sum()
+    net_pnl      = tdf["pnl_usdc"].sum()
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 else float("inf")
+
+    avg_win  = tdf.loc[tdf["pnl_usdc"] > 0, "pnl_usdc"].mean() if wins  else 0
+    avg_loss = tdf.loc[tdf["pnl_usdc"] < 0, "pnl_usdc"].mean() if losses else 0
+    avg_rr   = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf")
+
+    # Equity curve & drawdown
+    equity = ACCOUNT + tdf["pnl_usdc"].cumsum()
+    roll_max   = equity.cummax()
+    drawdown   = (equity - roll_max) / roll_max * 100
+    max_dd     = drawdown.min()
+    max_dd_usdc = (equity - roll_max).min()
+
+    # Sharpe (annualised, assume 5-min bars → 105,120 bars/year)
+    bars_per_year = 105_120
+    pnl_series    = tdf["pnl_usdc"]
+    if pnl_series.std() > 0:
+        sharpe = (pnl_series.mean() / pnl_series.std()) * math.sqrt(bars_per_year / (tdf["hold_bars"].mean() or 1))
+    else:
+        sharpe = 0.0
+
+    # Sortino
+    neg_returns = pnl_series[pnl_series < 0]
+    downside_std = neg_returns.std() if len(neg_returns) > 1 else 1e-9
+    sortino = (pnl_series.mean() / downside_std) * math.sqrt(bars_per_year / (tdf["hold_bars"].mean() or 1))
+
+    # Calmar
+    calmar = (net_pnl / ACCOUNT * 100) / abs(max_dd) if max_dd != 0 else float("inf")
+
+    # Consecutive wins/losses
+    streaks = tdf["outcome"].apply(lambda x: 1 if x == "TP" else (-1 if x == "SL" else 0))
+    max_cons_win = max_cons_loss = cur = 0
+    for s in streaks:
+        if s == 1:
+            cur = cur + 1 if cur > 0 else 1
+            max_cons_win = max(max_cons_win, cur)
+        elif s == -1:
+            cur = cur - 1 if cur < 0 else -1
+            max_cons_loss = min(max_cons_loss, cur)
+        else:
+            cur = 0
+
+    avg_hold_h = tdf["hold_bars"].mean() * 5 / 60   # 5-min bars → hours
+
+    data_start = df["open_time"].iloc[0]
+    data_end   = df["open_time"].iloc[-1]
+
+    return {
+        "data_start":      data_start,
+        "data_end":        data_end,
+        "total_candles":   len(df),
+        "total_trades":    total,
+        "wins":            wins,
+        "losses":          losses,
+        "open_trades":     open_t,
+        "win_rate":        win_rate,
+        "net_pnl":         net_pnl,
+        "gross_profit":    gross_profit,
+        "gross_loss":      gross_loss,
+        "profit_factor":   profit_factor,
+        "avg_win":         avg_win,
+        "avg_loss":        avg_loss,
+        "avg_rr":          avg_rr,
+        "max_dd_pct":      max_dd,
+        "max_dd_usdc":     max_dd_usdc,
+        "sharpe":          sharpe,
+        "sortino":         sortino,
+        "calmar":          calmar,
+        "max_cons_wins":   max_cons_win,
+        "max_cons_losses": abs(max_cons_loss),
+        "avg_hold_hours":  avg_hold_h,
+        "final_equity":    ACCOUNT + net_pnl,
+        "return_pct":      net_pnl / ACCOUNT * 100,
+    }
+
+
+def format_report(s: dict) -> str:
+    if "error" in s:
+        return f"❌ Backtest Error: {s['error']}"
+
+    verdict = "✅ PROFITABLE" if s["net_pnl"] > 0 else "❌ UNPROFITABLE"
+
+    return f"""
+📊 *BACKTEST REPORT — SOLUSDT 5m*
+{verdict}
+
+*━━━━━━ DATA ━━━━━━*
+📅 Period : {s['data_start'].strftime('%d %b %Y')} → {s['data_end'].strftime('%d %b %Y')}
+🕯 Candles : {s['total_candles']:,}
+
+*━━━━━━ STRATEGY ━━━━━━*
+• Entry  : RSI({RSI_PERIOD}) crosses above WMA({WMA_PERIOD}) & RSI < {RSI_MAX}
+• SL     : max(crossover low, close − {ATR_MULT}×ATR{ATR_PERIOD})
+• TP     : entry + {RR}× risk
+• Size   : $1,000 USDC fixed
+
+*━━━━━━ TRADE STATS ━━━━━━*
+📈 Total Trades : {s['total_trades']}
+✅ Wins         : {s['wins']}
+❌ Losses       : {s['losses']}
+🔓 Still Open   : {s['open_trades']}
+🎯 Win Rate     : {s['win_rate']:.2f}%
+⏱ Avg Hold     : {s['avg_hold_hours']:.1f} hrs
+
+*━━━━━━ P&L ━━━━━━*
+💰 Net P&L      : ${s['net_pnl']:+.2f}
+📈 Gross Profit : ${s['gross_profit']:.2f}
+📉 Gross Loss   : ${s['gross_loss']:.2f}
+🏦 Final Equity : ${s['final_equity']:.2f}
+📊 Total Return : {s['return_pct']:+.2f}%
+⚖️ Profit Factor: {s['profit_factor']:.2f}
+
+*━━━━━━ RISK / REWARD ━━━━━━*
+💚 Avg Win      : ${s['avg_win']:.2f}
+❤️ Avg Loss     : ${s['avg_loss']:.2f}
+📐 Avg R:R      : {s['avg_rr']:.2f}
+
+*━━━━━━ DRAWDOWN ━━━━━━*
+📉 Max Drawdown : {s['max_dd_pct']:.2f}%  (${s['max_dd_usdc']:.2f})
+
+*━━━━━━ RATIOS ━━━━━━*
+⚡ Sharpe Ratio  : {s['sharpe']:.3f}
+🛡 Sortino Ratio : {s['sortino']:.3f}
+🏔 Calmar Ratio  : {s['calmar']:.3f}
+
+*━━━━━━ STREAKS ━━━━━━*
+🔥 Max Cons. Wins   : {s['max_cons_wins']}
+💀 Max Cons. Losses : {s['max_cons_losses']}
+""".strip()
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if not os.path.exists(CONFIG["WATCHLIST_FILE"]):
-        print(f"Error: {CONFIG['WATCHLIST_FILE']} not found.")
-    else:
-        with open(CONFIG["WATCHLIST_FILE"]) as f:
-            symbols = [s.strip().upper() for s in f.read().splitlines() if s.strip()]
+    # 5-year window in milliseconds
+    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = end_ms - int(5 * 365.25 * 24 * 3600 * 1000)
 
-        for s in symbols:
-            ticker = s if "." in s else f"{s}.NS"
-            raw_df = yf.download(
-                ticker,
-                period=CONFIG["BACKTEST_PERIOD"],
-                interval="1h",
-                progress=False,
-            )
+    try:
+        df = fetch_klines(SYMBOL, INTERVAL, start_ms, end_ms)
 
-            if raw_df.empty:
-                continue
+        result  = run_backtest(df)
+        trades  = result["trades"]
+        df_used = result["df"]
 
-            if isinstance(raw_df.columns, pd.MultiIndex):
-                raw_df.columns = raw_df.columns.get_level_values(0)
-            raw_df.columns = [str(col) for col in raw_df.columns]
+        stats   = calc_stats(trades, df_used)
+        report  = format_report(stats)
 
-            for tf in CONFIG["TEST_TIMEFRAMES"]:
-                print(f"Analyzing {ticker} @ {tf}...")
-                df = resample_data(raw_df.copy(), tf)
+        print("\n" + report)
+        send_long_telegram(report)
+        log.info("Backtest complete. Report sent.")
 
-                cerebro = bt.Cerebro()
-                cerebro.adddata(bt.feeds.PandasData(dataname=df), name=f"{ticker}_{tf}")
-                cerebro.addstrategy(AdvancedRSIStrategy)
-                cerebro.broker.setcash(CONFIG["INITIAL_CASH"])
-
-                # FIX Warn #3: add realistic commission
-                cerebro.broker.setcommission(commission=CONFIG["COMMISSION"])
-
-                # FIX Bug #1: fill at current bar close so entry price matches close[0]
-                cerebro.broker.set_coc(True)
-
-                cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="tr")
-                cerebro.addanalyzer(bt.analyzers.DrawDown,       _name="dd")
-                cerebro.addanalyzer(bt.analyzers.SharpeRatio,    _name="sr",
-                                    riskfreerate=0.065, annualize=True)
-
-                try:
-                    results = cerebro.run()
-                    res = results[0].analyzers.tr.get_analysis()
-                    dd  = results[0].analyzers.dd.get_analysis()
-                    sr  = results[0].analyzers.sr.get_analysis()
-
-                    if 'total' in res and res.total.total > 0:
-                        pnl        = cerebro.broker.get_value() - CONFIG["INITIAL_CASH"]
-                        n_trades   = res.total.total
-                        n_wins     = res.won.total  if 'won'  in res else 0
-                        gross_p    = res.won.pnl.total  if 'won'  in res else 0
-                        gross_l    = abs(res.lost.pnl.total) if 'lost' in res else 0
-                        max_dd_val = dd.max.drawdown
-                        sharpe     = sr.get('sharperatio', 0) or 0
-
-                        # Global totals (FIX Warn #4: labelled correctly as "sum across runs")
-                        STATS["global"]["profit"]  += pnl
-                        STATS["global"]["trades"]  += n_trades
-                        STATS["global"]["wins"]    += n_wins
-                        STATS["global"]["gross_p"] += gross_p
-                        STATS["global"]["gross_l"] += gross_l
-                        STATS["global"]["max_dd"]   = max(STATS["global"]["max_dd"], max_dd_val)
-
-                        STATS["timeframes"][tf]["profit"] += pnl
-                        STATS["timeframes"][tf]["trades"] += n_trades
-                        STATS["timeframes"][tf]["wins"]   += n_wins
-
-                        if pnl > STATS["best"]["profit"]:
-                            STATS["best"] = {"name": f"{ticker} ({tf})", "profit": pnl}
-
-                        print(
-                            f"  {ticker} {tf}: ₹{pnl:.0f} | "
-                            f"trades={n_trades} | acc={n_wins/n_trades*100:.1f}% | "
-                            f"sharpe={sharpe:.2f} | dd={max_dd_val:.1f}%"
-                        )
-
-                except Exception as e:
-                    print(f"  Error {ticker} {tf}: {e}")
-
-            time.sleep(1)
-
-        # ── Final report ──────────────────────────────────────────────────────
-        g        = STATS["global"]
-        win_rate = (g["wins"]   / g["trades"] * 100) if g["trades"] > 0 else 0
-        pf       = (g["gross_p"] / g["gross_l"])      if g["gross_l"] > 0 else 0
-        exp      = (g["profit"] / g["trades"])         if g["trades"] > 0 else 0
-
-        tf_report = ""
-        for tf, data in STATS["timeframes"].items():
-            acc = (data["wins"] / data["trades"] * 100) if data["trades"] > 0 else 0
-            tf_report += f"• *{tf}:* ₹{data['profit']:.0f}  |  Trades: {data['trades']}  |  Acc: {acc:.1f}%\n"
-
-        master_report = (
-            f"🏛 *BACKTEST PERFORMANCE REPORT*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ _P/L below = sum across all independent symbol runs_\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💰 *TOTAL P/L (all runs):* ₹{g['profit']:.2f}\n"
-            f"📊 *OVERALL ACCURACY:*  {win_rate:.2f}%\n"
-            f"⚖️ *PROFIT FACTOR:*     {pf:.2f}\n"
-            f"📉 *WORST DRAWDOWN:*    {g['max_dd']:.2f}%\n"
-            f"🎯 *EXPECTANCY:*        ₹{exp:.2f} / trade\n"
-            f"🔢 *TOTAL TRADES:*      {g['trades']}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ *TIMEFRAME BREAKDOWN*\n"
-            f"{tf_report}"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🌟 *STAR PERFORMER:* {STATS['best']['name']} "
-            f"(₹{STATS['best']['profit']:.0f})\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 *PERIOD:* {CONFIG['BACKTEST_PERIOD']}  "
-            f"|  *COMMISSION:* {CONFIG['COMMISSION']*100:.1f}%\n"
-            f"🏁 *Report finalised.*"
-        )
-        send_msg(master_report)
-        print("\n" + master_report)
+    except Exception as e:
+        err = f"❌ Backtest crashed: {e}"
+        print(err)
+        log.exception("Backtest crashed")
+        send_telegram(err)
