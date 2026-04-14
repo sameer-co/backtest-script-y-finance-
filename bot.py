@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 TELEGRAM_BOT_TOKEN = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg"
 TELEGRAM_CHAT_ID   = "1950462171"
 
-SYMBOLS     = ["MONUSDT", "SOLUSDT"]
+SYMBOLS     = ["MONUSDT", "SOLUSDT" ,"HYPEUSDT"]
 TIMEFRAMES  = ["60", "240"]          # Bybit uses minutes: 60=1h, 240=4h
 TF_LABELS   = {"60": "1h", "240": "4h"}
 
