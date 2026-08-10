@@ -105,7 +105,7 @@ SETTINGS = {
 # ─────────────────────────────────────────────────────────────
 JUP_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUP_SWAP_URL  = "https://api.jup.ag/swap/v1/swap"
-JUP_API_KEY   = os.environ.get("JUP_API_KEY", "")   # free key from portal.jup.ag
+JUP_API_KEY   = os.environ.get("JUP_API_KEY", "jup_49606df56e21f143c91e662b594caed5c64164d9954e474dc0c2f8645917c633")   # free key from portal.jup.ag
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"  # swap for your own RPC for reliability
 
 SOL_MINT  = "So11111111111111111111111111111111111111112"
