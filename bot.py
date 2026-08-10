@@ -36,7 +36,7 @@ TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}"
 SYMBOL      = "SOLUSDT"
 INTERVAL    = "5m"
 START_DATE  = "2023-08-10"   # UTC, inclusive
-END_DATE    = "2024-08-10"   # UTC, exclusive (today's date -> pulls up to now)
+END_DATE    = "2026-08-10"   # UTC, exclusive (today's date -> pulls up to now)
 
 SETTINGS = {
     "atr_period"      : 14,
