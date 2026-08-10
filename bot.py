@@ -25,15 +25,25 @@ MODES
 REQUIREMENTS
   pip install requests numpy solders base58 --break-system-packages
 
-  Environment variables (live mode only):
-    JUP_WALLET_PRIVATE_KEY   base58-encoded Solana secret key
+  Environment variables:
+    JUP_API_KEY               free API key from https://portal.jup.ag
+                               (Jupiter now requires this on every quote/swap
+                               call -- the old unauthenticated quote-api.jup.ag
+                               endpoint was fully retired Oct 1 2025)
+    JUP_WALLET_PRIVATE_KEY     base58-encoded Solana secret key (live mode only)
 
 IMPORTANT LIMITS I CANNOT VERIFY FROM HERE
-  I cannot reach api.jup.ag, quote-api.jup.ag, or any Solana RPC from
-  my sandbox (network is allowlisted to a small set of dev domains),
-  so the Jupiter/Solana calls below are written carefully but UNTESTED
-  against the live network. Run this in DRY_RUN mode first and watch
-  the console + Telegram output before ever flipping DRY_RUN to False.
+  I cannot reach api.jup.ag or any Solana RPC from my sandbox (network is
+  allowlisted to a small set of dev domains), so the Jupiter/Solana calls
+  below are written carefully but UNTESTED against the live network.
+  Run this in DRY_RUN mode first and watch the console + Telegram output
+  before ever flipping DRY_RUN to False.
+
+  Jupiter's API has been through several endpoint migrations recently
+  (quote-api.jup.ag retired Oct 2025, lite-api.jup.ag anonymous access
+  being phased out). If api.jup.ag/swap/v1/quote starts failing too,
+  check https://dev.jup.ag/docs#whats-new for the current URL before
+  assuming the strategy logic is at fault.
 
   Also note: Binance's SOLUSDT price (used for signals) and Jupiter's
   on-chain SOL/USDC price (used for fills) are two different venues.
@@ -93,8 +103,9 @@ SETTINGS = {
 # ─────────────────────────────────────────────────────────────
 #  JUPITER / SOLANA EXECUTION
 # ─────────────────────────────────────────────────────────────
-JUP_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUP_SWAP_URL  = "https://quote-api.jup.ag/v6/swap"
+JUP_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
+JUP_SWAP_URL  = "https://api.jup.ag/swap/v1/swap"
+JUP_API_KEY   = os.environ.get("JUP_API_KEY", "")   # free key from portal.jup.ag
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"  # swap for your own RPC for reliability
 
 SOL_MINT  = "So11111111111111111111111111111111111111112"
@@ -245,6 +256,16 @@ def detect_signal(bricks, min_sell_bricks, sl_mult, tp_mult,
 # ─────────────────────────────────────────────────────────────
 #  JUPITER QUOTE / SWAP
 # ─────────────────────────────────────────────────────────────
+def _jup_headers():
+    if not JUP_API_KEY:
+        raise RuntimeError(
+            "JUP_API_KEY is not set. Jupiter retired unauthenticated access -- "
+            "get a free key at https://portal.jup.ag and set it as an "
+            "environment variable before running."
+        )
+    return {"x-api-key": JUP_API_KEY}
+
+
 def get_jupiter_quote(input_mint: str, output_mint: str, amount_base_units: int,
                        slippage_bps: int = SLIPPAGE_BPS):
     """
@@ -259,7 +280,7 @@ def get_jupiter_quote(input_mint: str, output_mint: str, amount_base_units: int,
         "slippageBps": slippage_bps,
         "swapMode": "ExactIn",
     }
-    r = requests.get(JUP_QUOTE_URL, params=params, timeout=15)
+    r = requests.get(JUP_QUOTE_URL, params=params, headers=_jup_headers(), timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -278,7 +299,7 @@ def execute_jupiter_swap(quote_response: dict, keypair, rpc_url: str = SOLANA_RP
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
         "prioritizationFeeLamports": "auto",
-    }, timeout=20)
+    }, headers=_jup_headers(), timeout=20)
     swap_resp.raise_for_status()
     swap_tx_b64 = swap_resp.json()["swapTransaction"]
 
