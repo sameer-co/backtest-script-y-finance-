@@ -1,6 +1,4 @@
-yfinance
 pandas
-pandas_ta
-backtrader
+numpy
 requests
-pytz
+matplotlib
