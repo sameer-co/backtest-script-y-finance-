@@ -1,70 +1,97 @@
 """
-NIFTY 50 T+2 OPEN EXIT BACKTEST
-================================
+NIFTY-50 T+2 OPEN EXIT / CLOSE ENTRY BACKTEST
+================================================
 
-STRATEGY
---------
+ONE-SYMBOL-AT-A-TIME DATA ARCHITECTURE
 
-Trading day T:
-    Select stock
-    BUY at CLOSE
+This script:
 
-Trading day T+1:
-    HOLD entire trading day
+1. Gets a list of NIFTY-50 symbols.
+2. Downloads each symbol separately from yfinance.
+3. Saves each symbol locally in data/cache/.
+4. On future runs, loads cached data instead of downloading again.
+5. Builds a daily cross-sectional ranking.
+6. Selects the highest-ranked stock from the top-20 basket.
+7. Uses 100% of capital in ONE stock.
+8. Buys at T CLOSE.
+9. Holds through T+1.
+10. Sells at T+2 OPEN.
+11. At T+2 CLOSE, enters the next position.
+12. Repeats.
 
-Trading day T+2:
-    SELL at OPEN
-    Position is now closed
+TRADE TIMELINE
+--------------
 
-Trading day T+2:
-    BUY a new position at CLOSE
+            T              T+1             T+2
+            │               │               │
+        BUY CLOSE          HOLD          SELL OPEN
+                                            │
+                                            │
+                                      position closed
+                                            │
+                                        BUY CLOSE
+                                            │
+                                            ▼
+                                      next position
 
-Then repeat.
-
-So:
-
-    T Close      -> BUY
-    T+1 Entire   -> HOLD
-    T+2 Open     -> SELL
-    T+2 Close    -> NEW BUY
-
-Only ONE position can exist at a time.
-
-STOCK SELECTION
----------------
-1. Take the eligible universe.
-2. Calculate 20-day momentum using only information
-   available at the current day's close.
-3. Rank stocks.
-4. Keep the top 20.
-5. Buy the #1 ranked stock.
-
-DATA
-----
-Uses yfinance daily OHLC data.
-
-IMPORTANT:
-yfinance does not provide historical NIFTY 50 membership.
-
-If nifty50_history.csv exists, the script uses it.
-
-Expected format:
-
-symbol,start_date,end_date
-RELIANCE.NS,2016-01-01,2099-12-31
-INFY.NS,2016-01-01,2099-12-31
-
-Otherwise the script uses a fallback basket of 20 large
-NSE stocks. That can introduce survivorship bias.
 
 INSTALL
 -------
+
 pip install yfinance pandas numpy matplotlib
+
 
 RUN
 ---
+
 python nifty_overnight_backtest.py
+
+
+OPTIONAL ENVIRONMENT VARIABLES
+------------------------------
+
+START_DATE=2016-01-01
+END_DATE=2026-08-26
+INITIAL_CAPITAL=100000
+TOP_BASKET_SIZE=20
+MOMENTUM_LOOKBACK=20
+
+
+IMPORTANT
+---------
+
+yfinance provides historical price data.
+
+yfinance does NOT provide a reliable historical NIFTY-50
+constituent history.
+
+Therefore this script has two modes:
+
+MODE 1:
+-------
+If "nifty50_history.csv" exists:
+
+symbol,start_date,end_date
+
+RELIANCE.NS,2016-01-01,2099-12-31
+...
+
+then historical membership is respected.
+
+MODE 2:
+-------
+If the file does not exist, the script uses the built-in
+NIFTY basket below.
+
+This means MODE 2 can contain survivorship bias.
+
+For a rigorous historical NIFTY-50 study, use historical
+membership data eventually.
+
+
 """
+
+from __future__ import annotations
 
 import os
 import math
@@ -77,6 +104,7 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 
+
 warnings.filterwarnings("ignore")
 
 
@@ -84,276 +112,712 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ============================================================
 
-INITIAL_CAPITAL = 100000.0
+INITIAL_CAPITAL = float(
+    os.getenv(
+        "INITIAL_CAPITAL",
+        "100000"
+    )
+)
 
-START_DATE = "2016-01-01"
-END_DATE = "2026-08-25"
+START_DATE = os.getenv(
+    "START_DATE",
+    "2016-01-01"
+)
 
-# Number of stocks considered after ranking.
-TOP_BASKET_SIZE = 20
+END_DATE = os.getenv(
+    "END_DATE",
+    "2026-08-26"
+)
 
-# Momentum used for ranking.
-MOMENTUM_LOOKBACK = 20
+TOP_BASKET_SIZE = int(
+    os.getenv(
+        "TOP_BASKET_SIZE",
+        "20"
+    )
+)
 
-# Historical NIFTY membership file.
-NIFTY_HISTORY_FILE = "nifty50_history.csv"
-
-# Output directory.
-OUTPUT_DIR = Path("backtest_results")
-OUTPUT_DIR.mkdir(exist_ok=True)
+MOMENTUM_LOOKBACK = int(
+    os.getenv(
+        "MOMENTUM_LOOKBACK",
+        "20"
+    )
+)
 
 
 # ============================================================
-# TRANSACTION COST CONFIGURATION
+# DIRECTORIES
 # ============================================================
 
-# Approximate Indian equity delivery costs.
-# Adjust these if you want to match your broker exactly.
+BASE_DIR = Path(
+    __file__
+).resolve().parent
+
+DATA_DIR = (
+    BASE_DIR
+    / "data"
+    / "cache"
+)
+
+RESULTS_DIR = (
+    BASE_DIR
+    / "backtest_results"
+)
+
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# TRANSACTION COSTS
+# ============================================================
 
 BROKERAGE_BUY = 0.0
 BROKERAGE_SELL = 0.0
 
-# STT
 STT_BUY = 0.001
 STT_SELL = 0.001
 
-# Approximate exchange transaction charge
 EXCHANGE_TXN_RATE = 0.0000297
 
-# SEBI turnover charge
 SEBI_RATE = 0.000001
 
-# Stamp duty on buy
 STAMP_DUTY_BUY = 0.00015
 
-# GST
 GST_RATE = 0.18
 
-# Set this above zero if you want slippage.
 SLIPPAGE_RATE = 0.0
 
 
 # ============================================================
-# FALLBACK 20 STOCK UNIVERSE
+# FALLBACK NIFTY UNIVERSE
 # ============================================================
 
-# Used only if historical membership CSV does not exist.
+NIFTY_50_SYMBOLS = [
 
-FALLBACK_STOCKS = [
-    "RELIANCE.NS",
-    "HDFCBANK.NS",
-    "ICICIBANK.NS",
-    "INFY.NS",
-    "TCS.NS",
-    "BHARTIARTL.NS",
-    "ITC.NS",
-    "LT.NS",
-    "SBIN.NS",
+    "ADANIENT.NS",
+    "ADANIPORTS.NS",
+    "APOLLOHOSP.NS",
+    "ASIANPAINT.NS",
     "AXISBANK.NS",
-    "KOTAKBANK.NS",
-    "HINDUNILVR.NS",
+    "BAJAJ-AUTO.NS",
     "BAJFINANCE.NS",
-    "MARUTI.NS",
-    "SUNPHARMA.NS",
+    "BAJAJFINSV.NS",
+    "BEL.NS",
+    "BHARTIARTL.NS",
+    "CIPLA.NS",
+    "COALINDIA.NS",
+    "DRREDDY.NS",
+    "EICHERMOT.NS",
+    "ETERNAL.NS",
+    "GRASIM.NS",
     "HCLTECH.NS",
+    "HDFCBANK.NS",
+    "HDFCLIFE.NS",
+    "HEROMOTOCO.NS",
+    "HINDALCO.NS",
+    "HINDUNILVR.NS",
+    "ICICIBANK.NS",
+    "INDUSINDBK.NS",
+    "INFY.NS",
+    "ITC.NS",
+    "JIOFIN.NS",
+    "JSWSTEEL.NS",
+    "KOTAKBANK.NS",
+    "LT.NS",
     "M&M.NS",
+    "MARUTI.NS",
+    "NESTLEIND.NS",
     "NTPC.NS",
+    "ONGC.NS",
+    "POWERGRID.NS",
+    "RELIANCE.NS",
+    "SBILIFE.NS",
+    "SBIN.NS",
+    "SHRIRAMFIN.NS",
+    "SUNPHARMA.NS",
+    "TATACONSUM.NS",
     "TATAMOTORS.NS",
     "TATASTEEL.NS",
+    "TCS.NS",
+    "TECHM.NS",
+    "TITAN.NS",
+    "TRENT.NS",
+    "ULTRACEMCO.NS",
+    "WIPRO.NS",
 ]
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# SYMBOL NORMALIZATION
 # ============================================================
 
 def clean_symbol(symbol):
 
-    symbol = str(symbol).strip().upper()
+    symbol = str(
+        symbol
+    ).strip().upper()
 
-    if symbol.startswith("NSE:"):
-        symbol = symbol.replace("NSE:", "")
+    if symbol.startswith(
+        "NSE:"
+    ):
 
-    if not symbol.endswith(".NS"):
+        symbol = symbol[
+            4:
+        ]
+
+    if not symbol.endswith(
+        ".NS"
+    ):
+
         symbol += ".NS"
 
     return symbol
 
 
+# ============================================================
+# HISTORICAL MEMBERSHIP
+# ============================================================
+
 def load_historical_membership():
 
-    path = Path(NIFTY_HISTORY_FILE)
+    path = (
+        BASE_DIR
+        / "nifty50_history.csv"
+    )
 
     if not path.exists():
+
+        print(
+            "\nHistorical membership file "
+            "not found."
+        )
+
+        print(
+            "Using built-in NIFTY-50 universe."
+        )
+
+        print(
+            "NOTE: this can contain "
+            "survivorship bias."
+        )
+
         return None
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(
+        path
+    )
 
-    required_columns = {
+    required = {
         "symbol",
         "start_date",
         "end_date"
     }
 
-    if not required_columns.issubset(df.columns):
+    if not required.issubset(
+        df.columns
+    ):
 
         raise ValueError(
-            "Historical membership CSV must contain:\n"
+            "\n"
+            "nifty50_history.csv must contain:\n"
             "symbol,start_date,end_date"
         )
 
-    df["symbol"] = df["symbol"].apply(clean_symbol)
-
-    df["start_date"] = pd.to_datetime(
-        df["start_date"]
+    df["symbol"] = (
+        df["symbol"]
+        .apply(clean_symbol)
     )
 
-    df["end_date"] = pd.to_datetime(
-        df["end_date"]
+    df["start_date"] = (
+        pd.to_datetime(
+            df["start_date"]
+        )
+    )
+
+    df["end_date"] = (
+        pd.to_datetime(
+            df["end_date"]
+        )
     )
 
     return df
 
 
-def is_member(symbol, date, membership):
+# ============================================================
+# GET SYMBOL LIST
+# ============================================================
+
+def get_symbols(
+    membership
+):
 
     if membership is None:
 
-        return symbol in FALLBACK_STOCKS
+        return sorted(
+            set(
+                NIFTY_50_SYMBOLS
+            )
+        )
+
+    return sorted(
+        membership[
+            "symbol"
+        ]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+
+# ============================================================
+# HISTORICAL MEMBERSHIP CHECK
+# ============================================================
+
+def is_member(
+    symbol,
+    date,
+    membership
+):
+
+    if membership is None:
+
+        return (
+            symbol
+            in NIFTY_50_SYMBOLS
+        )
 
     rows = membership[
-        membership["symbol"] == symbol
+        membership[
+            "symbol"
+        ]
+        == symbol
     ]
 
     if rows.empty:
+
         return False
 
     valid = rows[
-        (rows["start_date"] <= date)
+        (
+            rows[
+                "start_date"
+            ]
+            <= date
+        )
         &
-        (rows["end_date"] >= date)
+        (
+            rows[
+                "end_date"
+            ]
+            >= date
+        )
     ]
 
     return not valid.empty
 
 
 # ============================================================
-# DOWNLOAD DATA
+# CACHE PATH
 # ============================================================
 
-def download_stock_data(symbols):
+def cache_path(
+    symbol
+):
 
-    print("\nDownloading historical data...\n")
+    safe_symbol = (
+        symbol
+        .replace(
+            ".NS",
+            ""
+        )
+        .replace(
+            "/",
+            "_"
+        )
+    )
+
+    return (
+        DATA_DIR
+        / f"{safe_symbol}.csv"
+    )
+
+
+# ============================================================
+# DOWNLOAD ONE SYMBOL
+# ============================================================
+
+def download_one_symbol(
+    symbol
+):
+
+    path = cache_path(
+        symbol
+    )
+
+    # --------------------------------------------------------
+    # CACHE EXISTS
+    # --------------------------------------------------------
+
+    if path.exists():
+
+        print(
+            f"  CACHE: {symbol}"
+        )
+
+        df = pd.read_csv(
+            path,
+            index_col=0,
+            parse_dates=True
+        )
+
+        df.index = pd.to_datetime(
+            df.index
+        )
+
+        return df
+
+
+    # --------------------------------------------------------
+    # DOWNLOAD
+    # --------------------------------------------------------
+
+    print(
+        f"  DOWNLOAD: {symbol}"
+    )
+
+    end_plus_one = (
+        pd.Timestamp(
+            END_DATE
+        )
+        + pd.Timedelta(
+            days=1
+        )
+    ).strftime(
+        "%Y-%m-%d"
+    )
+
+    df = None
+
+    for attempt in range(3):
+
+        try:
+
+            df = yf.download(
+                symbol,
+                start=START_DATE,
+                end=end_plus_one,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False
+            )
+
+            if (
+                df is not None
+                and not df.empty
+            ):
+
+                break
+
+        except Exception as e:
+
+            print(
+                f"    retry "
+                f"{attempt + 1}: "
+                f"{e}"
+            )
+
+            time.sleep(
+                2
+            )
+
+    if (
+        df is None
+        or df.empty
+    ):
+
+        print(
+            f"    FAILED: {symbol}"
+        )
+
+        return None
+
+
+    # --------------------------------------------------------
+    # FIX YFINANCE MULTIINDEX
+    # --------------------------------------------------------
+
+    if isinstance(
+        df.columns,
+        pd.MultiIndex
+    ):
+
+        try:
+
+            df = df.xs(
+                symbol,
+                axis=1,
+                level=1
+            )
+
+        except Exception:
+
+            df.columns = (
+                df.columns
+                .get_level_values(
+                    0
+                )
+            )
+
+
+    # --------------------------------------------------------
+    # NORMALIZE COLUMN NAMES
+    # --------------------------------------------------------
+
+    df.columns = [
+
+        str(column)
+        .strip()
+        .lower()
+        .replace(
+            " ",
+            "_"
+        )
+
+        for column
+        in df.columns
+
+    ]
+
+
+    # --------------------------------------------------------
+    # VALIDATE
+    # --------------------------------------------------------
+
+    required = {
+        "open",
+        "close"
+    }
+
+    if not required.issubset(
+        df.columns
+    ):
+
+        print(
+            f"    FAILED: "
+            f"{symbol} "
+            f"missing Open/Close"
+        )
+
+        return None
+
+
+    # --------------------------------------------------------
+    # INDEX
+    # --------------------------------------------------------
+
+    df.index = pd.to_datetime(
+        df.index
+    )
+
+    if df.index.tz is not None:
+
+        df.index = (
+            df.index
+            .tz_localize(None)
+        )
+
+
+    # --------------------------------------------------------
+    # NUMERIC DATA
+    # --------------------------------------------------------
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "adj_close",
+        "volume"
+    ]:
+
+        if column in df.columns:
+
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
+
+
+    # --------------------------------------------------------
+    # CLEAN
+    # --------------------------------------------------------
+
+    df = (
+        df
+        .sort_index()
+        .dropna(
+            subset=[
+                "open",
+                "close"
+            ]
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # SAVE CACHE
+    # --------------------------------------------------------
+
+    df.to_csv(
+        path
+    )
+
+    print(
+        f"    SAVED: {path}"
+    )
+
+    return df
+
+
+# ============================================================
+# DOWNLOAD ALL SYMBOLS
+# ONE SYMBOL AT A TIME
+# ============================================================
+
+def load_all_data(
+    symbols
+):
 
     data = {}
 
-    end_plus_one = (
-        pd.Timestamp(END_DATE)
-        + pd.Timedelta(days=1)
-    ).strftime("%Y-%m-%d")
+    print(
+        "\n"
+        + "=" * 65
+    )
 
-    for number, symbol in enumerate(symbols, start=1):
+    print(
+        "FETCHING HISTORICAL DATA"
+    )
+
+    print(
+        "=" * 65
+    )
+
+    for number, symbol in enumerate(
+        symbols,
+        start=1
+    ):
 
         print(
-            f"[{number}/{len(symbols)}] Downloading {symbol}"
+            f"\n[{number}/{len(symbols)}]"
         )
 
-        df = None
+        df = download_one_symbol(
+            symbol
+        )
 
-        for attempt in range(3):
-
-            try:
-
-                df = yf.download(
-                    symbol,
-                    start=START_DATE,
-                    end=end_plus_one,
-                    interval="1d",
-                    auto_adjust=False,
-                    progress=False
-                )
-
-                if not df.empty:
-                    break
-
-            except Exception as e:
-
-                print(
-                    f"Attempt {attempt + 1} failed: {e}"
-                )
-
-                time.sleep(1)
-
-        if df is None or df.empty:
-
-            print(
-                f"Skipping {symbol}: no data"
-            )
+        if df is None:
 
             continue
 
-        # Handle MultiIndex returned by yfinance.
-        if isinstance(df.columns, pd.MultiIndex):
-
-            try:
-                df = df.xs(
-                    symbol,
-                    axis=1,
-                    level=1
-                )
-            except Exception:
-                df.columns = df.columns.get_level_values(0)
-
-        df.columns = [
-            str(column).lower().replace(" ", "_")
-            for column in df.columns
-        ]
-
-        required = ["open", "close"]
-
-        if not all(
-            column in df.columns
-            for column in required
+        if len(df) <= (
+            MOMENTUM_LOOKBACK
+            + 2
         ):
 
             print(
-                f"Skipping {symbol}: missing OHLC"
+                "    Insufficient history"
             )
 
             continue
 
-        df.index = pd.to_datetime(df.index)
+        data[
+            symbol
+        ] = df
 
-        # Remove timezone if present.
-        if df.index.tz is not None:
-
-            df.index = df.index.tz_localize(None)
-
-        df = df.sort_index()
-
-        df = df.dropna(
-            subset=["open", "close"]
-        )
-
-        if len(df) > MOMENTUM_LOOKBACK + 2:
-
-            data[symbol] = df
-
-            print(
-                f"  OK - {len(df)} trading days"
-            )
-
-        else:
-
-            print(
-                f"  Skipped - insufficient history"
-            )
+    print(
+        "\nSuccessfully loaded:"
+        f" {len(data)} symbols"
+    )
 
     return data
 
 
 # ============================================================
-# MOMENTUM CALCULATION
+# BUILD MARKET TRADING CALENDAR
+# ============================================================
+
+def build_trading_calendar(
+    data
+):
+
+    """
+    We need a common market calendar.
+
+    Instead of using the union of all stock dates,
+    use the intersection of available dates from the
+    largest/most complete reference stock.
+
+    For NIFTY stocks, RELIANCE is normally a good
+    reference. If unavailable, use the stock with
+    the largest number of observations.
+    """
+
+    if not data:
+
+        raise RuntimeError(
+            "No data available."
+        )
+
+    if "RELIANCE.NS" in data:
+
+        reference_symbol = (
+            "RELIANCE.NS"
+        )
+
+    else:
+
+        reference_symbol = max(
+            data,
+            key=lambda symbol:
+                len(data[symbol])
+        )
+
+    calendar = data[
+        reference_symbol
+    ].index
+
+    calendar = calendar[
+        (
+            calendar
+            >= pd.Timestamp(
+                START_DATE
+            )
+        )
+        &
+        (
+            calendar
+            <= pd.Timestamp(
+                END_DATE
+            )
+        )
+    ]
+
+    return pd.DatetimeIndex(
+        calendar
+    )
+
+
+# ============================================================
+# MOMENTUM
 # ============================================================
 
 def calculate_momentum(
@@ -362,31 +826,46 @@ def calculate_momentum(
 ):
 
     if date not in df.index:
+
         return None
 
-    location = df.index.get_loc(date)
+    position = (
+        df.index
+        .get_loc(date)
+    )
 
-    if location < MOMENTUM_LOOKBACK:
+    if position < (
+        MOMENTUM_LOOKBACK
+    ):
+
         return None
 
     current_close = float(
-        df.iloc[location]["close"]
+        df.iloc[
+            position
+        ]["close"]
     )
 
     previous_close = float(
         df.iloc[
-            location - MOMENTUM_LOOKBACK
+            position
+            - MOMENTUM_LOOKBACK
         ]["close"]
     )
 
-    if previous_close <= 0:
+    if (
+        current_close <= 0
+        or previous_close <= 0
+    ):
+
         return None
 
-    momentum = (
-        current_close / previous_close
-    ) - 1
-
-    return momentum
+    return (
+        current_close
+        /
+        previous_close
+        - 1
+    )
 
 
 # ============================================================
@@ -395,35 +874,41 @@ def calculate_momentum(
 
 def select_stock(
     entry_date,
-    stock_data,
+    data,
     membership
 ):
 
     rankings = []
 
-    for symbol, df in stock_data.items():
+    for symbol, df in data.items():
 
-        # Only use stocks that belong to the
-        # historical universe on this date.
+        # Historical membership
         if not is_member(
             symbol,
             entry_date,
             membership
         ):
+
             continue
 
-        momentum = calculate_momentum(
-            df,
-            entry_date
+        momentum = (
+            calculate_momentum(
+                df,
+                entry_date
+            )
         )
 
         if momentum is None:
+
             continue
 
         rankings.append(
             {
-                "symbol": symbol,
-                "momentum": momentum
+                "symbol":
+                    symbol,
+
+                "momentum":
+                    momentum
             }
         )
 
@@ -431,52 +916,85 @@ def select_stock(
 
         return None, None
 
-    ranking_df = pd.DataFrame(rankings)
+    ranking = pd.DataFrame(
+        rankings
+    )
 
-    ranking_df = ranking_df.sort_values(
-        "momentum",
-        ascending=False
-    ).reset_index(drop=True)
+    ranking = ranking.sort_values(
+        [
+            "momentum",
+            "symbol"
+        ],
+        ascending=[
+            False,
+            True
+        ]
+    ).reset_index(
+        drop=True
+    )
 
-    # Keep top 20 candidates.
-    top_basket = ranking_df.head(
+    ranking["rank"] = (
+        np.arange(
+            1,
+            len(ranking) + 1
+        )
+    )
+
+    top20 = ranking.head(
         TOP_BASKET_SIZE
     )
 
-    # Select highest ranked stock.
-    selected_stock = top_basket.iloc[0]["symbol"]
+    if top20.empty:
 
-    selected_momentum = float(
-        top_basket.iloc[0]["momentum"]
+        return None, ranking
+
+    selected = (
+        top20.iloc[0]["symbol"]
     )
 
-    return selected_stock, selected_momentum
+    selected_score = float(
+        top20.iloc[0][
+            "momentum"
+        ]
+    )
+
+    return (
+        selected,
+        selected_score
+    )
 
 
 # ============================================================
-# PRICE VALIDATION
+# GET PRICE
 # ============================================================
 
 def get_price(
-    stock_data,
+    data,
     symbol,
     date,
     column
 ):
 
-    if symbol not in stock_data:
+    if symbol not in data:
+
         return None
 
-    df = stock_data[symbol]
+    df = data[
+        symbol
+    ]
 
     if date not in df.index:
-        return None
 
-    value = df.loc[date, column]
+        return None
 
     try:
 
-        value = float(value)
+        value = float(
+            df.loc[
+                date,
+                column
+            ]
+        )
 
     except Exception:
 
@@ -496,53 +1014,65 @@ def get_price(
 # SLIPPAGE
 # ============================================================
 
-def apply_slippage(
+def execute_price(
     price,
     side
 ):
 
     if side == "BUY":
 
-        return price * (
-            1 + SLIPPAGE_RATE
+        return (
+            price
+            * (
+                1
+                + SLIPPAGE_RATE
+            )
         )
 
-    elif side == "SELL":
-
-        return price * (
-            1 - SLIPPAGE_RATE
+    return (
+        price
+        * (
+            1
+            - SLIPPAGE_RATE
         )
-
-    return price
+    )
 
 
 # ============================================================
-# COST CALCULATION
+# TRANSACTION COSTS
 # ============================================================
 
-def calculate_transaction_costs(
+def calculate_costs(
     buy_value,
     sell_value
 ):
 
     brokerage = (
-        buy_value * BROKERAGE_BUY
+        buy_value
+        * BROKERAGE_BUY
         +
-        sell_value * BROKERAGE_SELL
+        sell_value
+        * BROKERAGE_SELL
     )
 
     stt = (
-        buy_value * STT_BUY
+        buy_value
+        * STT_BUY
         +
-        sell_value * STT_SELL
+        sell_value
+        * STT_SELL
     )
 
-    exchange_charges = (
-        buy_value + sell_value
+    exchange = (
+        buy_value
+        +
+        sell_value
     ) * EXCHANGE_TXN_RATE
 
-    sebi_charges = (
-        buy_value + sell_value
+    sebi = (
+        buy_value
+        +
+        sell_value
     ) * SEBI_RATE
 
     stamp_duty = (
@@ -550,22 +1080,22 @@ def calculate_transaction_costs(
         * STAMP_DUTY_BUY
     )
 
-    gst = GST_RATE * (
+    gst = (
         brokerage
         +
-        exchange_charges
+        exchange
         +
-        sebi_charges
-    )
+        sebi
+    ) * GST_RATE
 
-    total_cost = (
+    total = (
         brokerage
         +
         stt
         +
-        exchange_charges
+        exchange
         +
-        sebi_charges
+        sebi
         +
         stamp_duty
         +
@@ -573,91 +1103,82 @@ def calculate_transaction_costs(
     )
 
     return {
-        "brokerage": brokerage,
-        "stt": stt,
-        "exchange_charges": exchange_charges,
-        "sebi_charges": sebi_charges,
-        "stamp_duty": stamp_duty,
-        "gst": gst,
-        "total_cost": total_cost
+        "brokerage":
+            brokerage,
+
+        "stt":
+            stt,
+
+        "exchange":
+            exchange,
+
+        "sebi":
+            sebi,
+
+        "stamp_duty":
+            stamp_duty,
+
+        "gst":
+            gst,
+
+        "total":
+            total
     }
 
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST
 # ============================================================
 
 def run_backtest(
-    stock_data,
-    membership
+    data,
+    membership,
+    calendar
 ):
 
-    # Build a master list of all trading dates.
-    all_dates = set()
-
-    for df in stock_data.values():
-
-        all_dates.update(
-            df.index.tolist()
-        )
-
-    trading_dates = sorted(
-        date
-        for date in all_dates
-        if (
-            date >= pd.Timestamp(START_DATE)
-            and
-            date <= pd.Timestamp(END_DATE)
-        )
+    capital = (
+        INITIAL_CAPITAL
     )
-
-    trading_dates = pd.DatetimeIndex(
-        trading_dates
-    )
-
-    capital = INITIAL_CAPITAL
 
     trades = []
 
-    equity_curve = [
-        {
-            "date": trading_dates[0],
-            "equity": capital
-        }
-    ]
+    equity = []
 
-    # IMPORTANT:
-    #
-    # We manually advance the index.
-    #
-    # Entry:
-    #       T close
-    #
-    # Exit:
-    #       T+2 open
-    #
-    # Next entry:
-    #       T+2 close
-    #
-    # Therefore after exiting, the next trade starts
-    # on the same date at close.
-    #
     i = 0
 
-    while i < len(trading_dates) - 2:
-
-        entry_date = trading_dates[i]
-
-        exit_date = trading_dates[i + 2]
+    while (
+        i
+        <
+        len(calendar) - 2
+    ):
 
         # ----------------------------------------------------
-        # 1. SELECT STOCK AT ENTRY DAY CLOSE
+        # ENTRY DATE
         # ----------------------------------------------------
 
-        symbol, momentum = select_stock(
-            entry_date,
-            stock_data,
-            membership
+        entry_date = (
+            calendar[i]
+        )
+
+        # ----------------------------------------------------
+        # EXIT DATE
+        # ----------------------------------------------------
+
+        exit_date = (
+            calendar[i + 2]
+        )
+
+
+        # ----------------------------------------------------
+        # SELECT STOCK
+        # ----------------------------------------------------
+
+        symbol, momentum = (
+            select_stock(
+                entry_date,
+                data,
+                membership
+            )
         )
 
         if symbol is None:
@@ -666,216 +1187,283 @@ def run_backtest(
 
             continue
 
+
         # ----------------------------------------------------
-        # 2. GET ENTRY PRICE
+        # ENTRY PRICE
         # ----------------------------------------------------
 
-        raw_entry_price = get_price(
-            stock_data,
+        raw_entry = get_price(
+            data,
             symbol,
             entry_date,
             "close"
         )
 
+
         # ----------------------------------------------------
-        # 3. GET EXIT PRICE
+        # EXIT PRICE
         # ----------------------------------------------------
 
-        raw_exit_price = get_price(
-            stock_data,
+        raw_exit = get_price(
+            data,
             symbol,
             exit_date,
             "open"
         )
 
+
         if (
-            raw_entry_price is None
-            or raw_exit_price is None
+            raw_entry is None
+            or raw_exit is None
         ):
 
             i += 1
 
             continue
 
-        entry_price = apply_slippage(
-            raw_entry_price,
-            "BUY"
+
+        entry_price = (
+            execute_price(
+                raw_entry,
+                "BUY"
+            )
         )
 
-        exit_price = apply_slippage(
-            raw_exit_price,
-            "SELL"
+        exit_price = (
+            execute_price(
+                raw_exit,
+                "SELL"
+            )
         )
 
+
         # ----------------------------------------------------
-        # 4. 100% CAPITAL ALLOCATION
+        # 100% CAPITAL
         # ----------------------------------------------------
 
-        capital_before = capital
+        capital_before = (
+            capital
+        )
 
         shares = (
             capital_before
-            / entry_price
+            /
+            entry_price
         )
 
         buy_value = (
             shares
-            * entry_price
+            *
+            entry_price
         )
 
         sell_value = (
             shares
-            * exit_price
+            *
+            exit_price
         )
 
+
         # ----------------------------------------------------
-        # 5. COSTS
+        # COST
         # ----------------------------------------------------
 
-        costs = calculate_transaction_costs(
-            buy_value,
-            sell_value
+        costs = (
+            calculate_costs(
+                buy_value,
+                sell_value
+            )
         )
 
-        total_cost = costs[
-            "total_cost"
-        ]
+        total_cost = (
+            costs["total"]
+        )
+
 
         # ----------------------------------------------------
-        # 6. P&L
+        # P&L
         # ----------------------------------------------------
 
         gross_pnl = (
             sell_value
-            - buy_value
+            -
+            buy_value
         )
 
         net_pnl = (
             gross_pnl
-            - total_cost
-        )
-
-        gross_return = (
-            gross_pnl
-            / capital_before
+            -
+            total_cost
         )
 
         net_return = (
             net_pnl
-            / capital_before
+            /
+            capital_before
+        )
+
+
+        # ----------------------------------------------------
+        # UPDATE CAPITAL
+        # ----------------------------------------------------
+
+        capital_after = (
+            capital_before
+            +
+            net_pnl
         )
 
         capital = (
-            capital_before
-            + net_pnl
+            capital_after
         )
 
-        # ----------------------------------------------------
-        # 7. SAVE TRADE
-        # ----------------------------------------------------
-
-        trade = {
-            "entry_date": entry_date,
-            "exit_date": exit_date,
-
-            "symbol": symbol,
-
-            "momentum_at_entry": momentum,
-
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-
-            "shares": shares,
-
-            "capital_before": capital_before,
-            "capital_after": capital,
-
-            "buy_value": buy_value,
-            "sell_value": sell_value,
-
-            "gross_pnl": gross_pnl,
-            "transaction_cost": total_cost,
-            "net_pnl": net_pnl,
-
-            "gross_return": gross_return,
-            "net_return": net_return,
-
-            "win": net_pnl > 0
-        }
-
-        trades.append(trade)
-
-        equity_curve.append(
-            {
-                "date": exit_date,
-                "equity": capital
-            }
-        )
 
         # ----------------------------------------------------
-        # CRITICAL PART
+        # TRADE RECORD
+        # ----------------------------------------------------
+
+        trades.append({
+
+            "entry_date":
+                entry_date,
+
+            "exit_date":
+                exit_date,
+
+            "symbol":
+                symbol,
+
+            "momentum":
+                momentum,
+
+            "entry_price":
+                entry_price,
+
+            "exit_price":
+                exit_price,
+
+            "shares":
+                shares,
+
+            "capital_before":
+                capital_before,
+
+            "buy_value":
+                buy_value,
+
+            "sell_value":
+                sell_value,
+
+            "gross_pnl":
+                gross_pnl,
+
+            "transaction_cost":
+                total_cost,
+
+            "net_pnl":
+                net_pnl,
+
+            "net_return":
+                net_return,
+
+            "capital_after":
+                capital_after,
+
+            "win":
+                net_pnl > 0
+
+        })
+
+
+        # ----------------------------------------------------
+        # EQUITY
+        # ----------------------------------------------------
+
+        equity.append({
+
+            "date":
+                exit_date,
+
+            "equity":
+                capital
+
+        })
+
+
+        # ----------------------------------------------------
+        # VERY IMPORTANT
         # ----------------------------------------------------
         #
-        # We exited at T+2 OPEN.
+        # Current trade:
         #
-        # We can enter another position at T+2 CLOSE.
+        # i       = T
+        # i + 1   = T+1
+        # i + 2   = T+2 EXIT
         #
-        # Therefore next entry index is:
+        # New position is allowed at:
         #
-        # i = i + 2
+        # T+2 CLOSE
         #
-        # NOT i + 1
+        # Therefore:
         #
-        # This prevents overlapping positions.
+        # next entry = i + 2
+        #
+        # This guarantees:
+        #
+        # NO OVERLAPPING POSITIONS
+        #
         # ----------------------------------------------------
 
         i += 2
 
-    trades_df = pd.DataFrame(trades)
 
-    equity_df = pd.DataFrame(
-        equity_curve
+    trades = pd.DataFrame(
+        trades
     )
 
-    equity_df = (
-        equity_df
-        .sort_values("date")
-        .drop_duplicates(
-            "date",
-            keep="last"
-        )
-        .reset_index(drop=True)
+    equity = pd.DataFrame(
+        equity
     )
 
-    return trades_df, equity_df
+    return (
+        trades,
+        equity
+    )
 
 
 # ============================================================
 # MAX DRAWDOWN
 # ============================================================
 
-def calculate_max_drawdown(
+def max_drawdown(
     equity
 ):
 
-    running_peak = equity.cummax()
+    peak = (
+        equity
+        .cummax()
+    )
 
     drawdown = (
         equity
-        / running_peak
+        /
+        peak
         - 1
     )
 
-    max_drawdown = drawdown.min()
+    max_dd = (
+        drawdown.min()
+    )
 
-    max_drawdown_amount = (
+    amount = (
         equity
-        - running_peak
+        -
+        peak
     ).min()
 
     return (
-        max_drawdown,
-        max_drawdown_amount
+        max_dd,
+        amount
     )
 
 
@@ -883,24 +1471,33 @@ def calculate_max_drawdown(
 # SHARPE
 # ============================================================
 
-def calculate_sharpe(
+def sharpe_ratio(
     returns
 ):
 
-    returns = returns.dropna()
+    returns = (
+        returns
+        .dropna()
+    )
 
     if len(returns) < 2:
+
         return np.nan
 
-    std = returns.std()
+    std = (
+        returns.std()
+    )
 
     if std == 0:
+
         return np.nan
 
     return (
         returns.mean()
-        / std
-        * math.sqrt(252)
+        /
+        std
+        *
+        math.sqrt(252)
     )
 
 
@@ -908,30 +1505,41 @@ def calculate_sharpe(
 # SORTINO
 # ============================================================
 
-def calculate_sortino(
+def sortino_ratio(
     returns
 ):
 
-    returns = returns.dropna()
-
-    downside = returns[
-        returns < 0
-    ]
-
-    if len(downside) == 0:
-        return np.nan
-
-    downside_deviation = np.sqrt(
-        (downside ** 2).mean()
+    returns = (
+        returns
+        .dropna()
     )
 
-    if downside_deviation == 0:
+    downside = (
+        returns[
+            returns < 0
+        ]
+    )
+
+    if downside.empty:
+
+        return np.nan
+
+    downside_dev = np.sqrt(
+        (
+            downside ** 2
+        ).mean()
+    )
+
+    if downside_dev == 0:
+
         return np.nan
 
     return (
         returns.mean()
-        / downside_deviation
-        * math.sqrt(252)
+        /
+        downside_dev
+        *
+        math.sqrt(252)
     )
 
 
@@ -939,36 +1547,40 @@ def calculate_sortino(
 # CONSECUTIVE WINS / LOSSES
 # ============================================================
 
-def consecutive_stats(
+def streaks(
     trades
 ):
 
     max_wins = 0
     max_losses = 0
 
-    current_wins = 0
-    current_losses = 0
+    wins = 0
+    losses = 0
 
-    for pnl in trades["net_pnl"]:
+    for pnl in (
+        trades[
+            "net_pnl"
+        ]
+    ):
 
         if pnl > 0:
 
-            current_wins += 1
-            current_losses = 0
+            wins += 1
+            losses = 0
 
         else:
 
-            current_losses += 1
-            current_wins = 0
+            losses += 1
+            wins = 0
 
         max_wins = max(
             max_wins,
-            current_wins
+            wins
         )
 
         max_losses = max(
             max_losses,
-            current_losses
+            losses
         )
 
     return (
@@ -978,7 +1590,7 @@ def consecutive_stats(
 
 
 # ============================================================
-# PERFORMANCE METRICS
+# METRICS
 # ============================================================
 
 def calculate_metrics(
@@ -986,115 +1598,185 @@ def calculate_metrics(
     equity
 ):
 
-    total_trades = len(trades)
-
-    if total_trades == 0:
+    if trades.empty:
 
         return {}
 
     final_capital = float(
-        trades.iloc[-1]["capital_after"]
+        trades.iloc[-1][
+            "capital_after"
+        ]
     )
 
     total_pnl = (
         final_capital
-        - INITIAL_CAPITAL
+        -
+        INITIAL_CAPITAL
     )
 
     total_return = (
         final_capital
-        / INITIAL_CAPITAL
-        - 1
+        /
+        INITIAL_CAPITAL
+        -
+        1
     )
 
     winners = trades[
-        trades["net_pnl"] > 0
+        trades[
+            "net_pnl"
+        ] > 0
     ]
 
     losers = trades[
-        trades["net_pnl"] < 0
+        trades[
+            "net_pnl"
+        ] < 0
     ]
+
+    total_trades = (
+        len(trades)
+    )
 
     win_rate = (
         len(winners)
-        / total_trades
+        /
+        total_trades
     )
 
     avg_win = (
-        winners["net_return"].mean()
-        if len(winners) > 0
+        winners[
+            "net_return"
+        ].mean()
+        if not winners.empty
         else 0
     )
 
     avg_loss = (
-        losers["net_return"].mean()
-        if len(losers) > 0
+        losers[
+            "net_return"
+        ].mean()
+        if not losers.empty
         else 0
     )
 
     expectancy = (
-        win_rate * avg_win
+        win_rate
+        *
+        avg_win
         +
-        (1 - win_rate) * avg_loss
+        (
+            1
+            -
+            win_rate
+        )
+        *
+        avg_loss
     )
 
-    gross_profit = winners[
-        "net_pnl"
-    ].sum()
+    gross_profit = (
+        winners[
+            "net_pnl"
+        ].sum()
+    )
 
     gross_loss = abs(
-        losers["net_pnl"].sum()
+        losers[
+            "net_pnl"
+        ].sum()
     )
 
     if gross_loss > 0:
 
         profit_factor = (
             gross_profit
-            / gross_loss
+            /
+            gross_loss
         )
 
     else:
 
         profit_factor = np.inf
 
-    # Equity returns
-    equity = equity.copy()
 
-    equity["return"] = equity[
-        "equity"
-    ].pct_change()
+    # --------------------------------------------------------
+    # EQUITY RETURNS
+    # --------------------------------------------------------
 
-    sharpe = calculate_sharpe(
-        equity["return"]
+    equity = (
+        equity
+        .sort_values(
+            "date"
+        )
+        .drop_duplicates(
+            "date",
+            keep="last"
+        )
+        .copy()
     )
 
-    sortino = calculate_sortino(
-        equity["return"]
+    equity[
+        "daily_return"
+    ] = (
+        equity[
+            "equity"
+        ]
+        .pct_change()
     )
 
-    max_dd, max_dd_amount = (
-        calculate_max_drawdown(
-            equity["equity"]
+
+    # --------------------------------------------------------
+    # DRAWDOWN
+    # --------------------------------------------------------
+
+    max_dd, dd_amount = (
+        max_drawdown(
+            equity[
+                "equity"
+            ]
         )
     )
 
-    annual_volatility = (
-        equity["return"].std()
-        * math.sqrt(252)
+
+    # --------------------------------------------------------
+    # SHARPE / SORTINO
+    # --------------------------------------------------------
+
+    sharpe = (
+        sharpe_ratio(
+            equity[
+                "daily_return"
+            ]
+        )
     )
 
-    # CAGR
-    start_date = equity[
-        "date"
-    ].iloc[0]
+    sortino = (
+        sortino_ratio(
+            equity[
+                "daily_return"
+            ]
+        )
+    )
 
-    end_date = equity[
-        "date"
-    ].iloc[-1]
+
+    # --------------------------------------------------------
+    # CAGR
+    # --------------------------------------------------------
+
+    start = pd.to_datetime(
+        equity[
+            "date"
+        ].iloc[0]
+    )
+
+    end = pd.to_datetime(
+        equity[
+            "date"
+        ].iloc[-1]
+    )
 
     years = (
-        end_date
-        - start_date
+        end - start
     ).days / 365.25
 
     if years > 0:
@@ -1102,170 +1784,243 @@ def calculate_metrics(
         cagr = (
             (
                 final_capital
-                / INITIAL_CAPITAL
+                /
+                INITIAL_CAPITAL
             )
             **
-            (1 / years)
-        ) - 1
+            (
+                1
+                /
+                years
+            )
+            -
+            1
+        )
 
     else:
 
         cagr = np.nan
 
-    max_wins, max_losses = (
-        consecutive_stats(trades)
+
+    # --------------------------------------------------------
+    # VOLATILITY
+    # --------------------------------------------------------
+
+    volatility = (
+        equity[
+            "daily_return"
+        ].std()
+        *
+        math.sqrt(252)
     )
+
+
+    # --------------------------------------------------------
+    # STREAKS
+    # --------------------------------------------------------
+
+    max_wins, max_losses = (
+        streaks(
+            trades
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # METRICS
+    # --------------------------------------------------------
 
     return {
 
-        "Initial Capital":
+        "initial_capital":
             INITIAL_CAPITAL,
 
-        "Final Capital":
+        "final_capital":
             final_capital,
 
-        "Total P&L":
+        "total_pnl":
             total_pnl,
 
-        "Total Return":
+        "total_return":
             total_return,
 
-        "CAGR":
+        "cagr":
             cagr,
 
-        "Total Trades":
+        "total_trades":
             total_trades,
 
-        "Winning Trades":
+        "winning_trades":
             len(winners),
 
-        "Losing Trades":
+        "losing_trades":
             len(losers),
 
-        "Win Rate":
+        "win_rate":
             win_rate,
 
-        "Average Trade":
-            trades["net_return"].mean(),
+        "average_trade":
+            trades[
+                "net_return"
+            ].mean(),
 
-        "Average Winner":
+        "average_winner":
             avg_win,
 
-        "Average Loser":
+        "average_loser":
             avg_loss,
 
-        "Expectancy Per Trade":
+        "expectancy":
             expectancy,
 
-        "Profit Factor":
+        "profit_factor":
             profit_factor,
 
-        "Max Drawdown":
+        "max_drawdown":
             max_dd,
 
-        "Max Drawdown Amount":
-            max_dd_amount,
+        "max_drawdown_amount":
+            dd_amount,
 
-        "Sharpe Ratio":
+        "annual_volatility":
+            volatility,
+
+        "sharpe":
             sharpe,
 
-        "Sortino Ratio":
+        "sortino":
             sortino,
 
-        "Annualized Volatility":
-            annual_volatility,
+        "best_trade":
+            trades[
+                "net_return"
+            ].max(),
 
-        "Best Trade":
-            trades["net_return"].max(),
+        "worst_trade":
+            trades[
+                "net_return"
+            ].min(),
 
-        "Worst Trade":
-            trades["net_return"].min(),
-
-        "Max Consecutive Wins":
+        "max_consecutive_wins":
             max_wins,
 
-        "Max Consecutive Losses":
+        "max_consecutive_losses":
             max_losses,
 
-        "Total Transaction Costs":
+        "total_transaction_cost":
             trades[
                 "transaction_cost"
             ].sum()
+
     }
 
 
 # ============================================================
-# DISPLAY REPORT
+# REPORT
 # ============================================================
 
-def print_metrics(metrics):
+def print_report(
+    metrics
+):
 
-    print("\n")
-    print("=" * 65)
-    print("BACKTEST RESULTS")
-    print("=" * 65)
+    print(
+        "\n"
+        + "=" * 65
+    )
+
+    print(
+        "FINAL BACKTEST REPORT"
+    )
+
+    print(
+        "=" * 65
+    )
+
+    money_metrics = {
+        "initial_capital",
+        "final_capital",
+        "total_pnl",
+        "max_drawdown_amount",
+        "total_transaction_cost"
+    }
+
+    percent_metrics = {
+        "total_return",
+        "cagr",
+        "win_rate",
+        "average_trade",
+        "average_winner",
+        "average_loser",
+        "expectancy",
+        "max_drawdown",
+        "annual_volatility",
+        "best_trade",
+        "worst_trade"
+    }
 
     for key, value in metrics.items():
 
-        if (
-            "Return" in key
-            or "Rate" in key
-            or "CAGR" in key
-            or "Drawdown" in key
-            or "Winner" in key
-            or "Loser" in key
-            or "Expectancy" in key
-            or "Trade" in key
-            and isinstance(value, float)
-        ):
+        label = (
+            key
+            .replace(
+                "_",
+                " "
+            )
+            .title()
+        )
 
-            if np.isfinite(value):
-
-                print(
-                    f"{key:<30}: "
-                    f"{value * 100:.2f}%"
-                )
-
-            else:
-
-                print(
-                    f"{key:<30}: N/A"
-                )
-
-        elif (
-            "Capital" in key
-            or "P&L" in key
-            or "Amount" in key
-            or "Costs" in key
-        ):
+        if key in money_metrics:
 
             print(
-                f"{key:<30}: "
-                f"₹{value:,.2f}"
+                f"{label:<30}"
+                f": ₹{value:,.2f}"
             )
 
-        elif isinstance(value, float):
+        elif key in percent_metrics:
 
             if np.isfinite(value):
 
                 print(
-                    f"{key:<30}: "
-                    f"{value:.4f}"
+                    f"{label:<30}"
+                    f": {value * 100:.2f}%"
                 )
 
             else:
 
                 print(
-                    f"{key:<30}: N/A"
+                    f"{label:<30}"
+                    ": N/A"
+                )
+
+        elif isinstance(
+            value,
+            float
+        ):
+
+            if np.isfinite(value):
+
+                print(
+                    f"{label:<30}"
+                    f": {value:.4f}"
+                )
+
+            else:
+
+                print(
+                    f"{label:<30}"
+                    ": N/A"
                 )
 
         else:
 
             print(
-                f"{key:<30}: {value}"
+                f"{label:<30}"
+                f": {value}"
             )
 
-    print("=" * 65)
+    print(
+        "=" * 65
+    )
 
 
 # ============================================================
@@ -1278,47 +2033,81 @@ def save_results(
     metrics
 ):
 
+    trades_path = (
+        RESULTS_DIR
+        /
+        "trades.csv"
+    )
+
+    equity_path = (
+        RESULTS_DIR
+        /
+        "equity_curve.csv"
+    )
+
+    metrics_path = (
+        RESULTS_DIR
+        /
+        "metrics.csv"
+    )
+
+    plot_path = (
+        RESULTS_DIR
+        /
+        "equity_curve.png"
+    )
+
     trades.to_csv(
-        OUTPUT_DIR / "trades.csv",
+        trades_path,
         index=False
     )
 
     equity.to_csv(
-        OUTPUT_DIR / "equity_curve.csv",
+        equity_path,
         index=False
     )
 
-    metrics_df = pd.DataFrame(
-        list(metrics.items()),
+    pd.DataFrame(
+        list(
+            metrics.items()
+        ),
         columns=[
-            "Metric",
-            "Value"
+            "metric",
+            "value"
         ]
-    )
-
-    metrics_df.to_csv(
-        OUTPUT_DIR / "metrics.csv",
+    ).to_csv(
+        metrics_path,
         index=False
     )
 
-    # Equity curve plot.
+
+    # --------------------------------------------------------
+    # EQUITY CURVE
+    # --------------------------------------------------------
+
     plt.figure(
         figsize=(14, 7)
     )
 
     plt.plot(
-        equity["date"],
-        equity["equity"]
+        equity[
+            "date"
+        ],
+        equity[
+            "equity"
+        ]
     )
 
     plt.title(
-        "Portfolio Equity Curve"
+        "NIFTY-50 T+2 Strategy Equity Curve"
     )
 
-    plt.xlabel("Date")
+    plt.xlabel(
+        "Date"
+    )
 
     plt.ylabel(
-        "Portfolio Value (INR)"
+        "Portfolio Value ₹"
     )
 
     plt.grid(
@@ -1329,28 +2118,31 @@ def save_results(
     plt.tight_layout()
 
     plt.savefig(
-        OUTPUT_DIR / "equity_curve.png",
+        plot_path,
         dpi=150
     )
 
     plt.close()
 
-    print("\nResults saved to:")
 
     print(
-        OUTPUT_DIR / "trades.csv"
+        "\nResults:"
     )
 
     print(
-        OUTPUT_DIR / "equity_curve.csv"
+        trades_path
     )
 
     print(
-        OUTPUT_DIR / "metrics.csv"
+        equity_path
     )
 
     print(
-        OUTPUT_DIR / "equity_curve.png"
+        metrics_path
+    )
+
+    print(
+        plot_path
     )
 
 
@@ -1360,102 +2152,108 @@ def save_results(
 
 def main():
 
-    print("=" * 65)
-
     print(
-        "NIFTY T+2 OPEN EXIT BACKTEST"
-    )
-
-    print("=" * 65)
-
-    print("\nStrategy rules:")
-
-    print(
-        "BUY  : Day T close"
+        "=" * 65
     )
 
     print(
-        "HOLD : Entire Day T+1"
+        "NIFTY-50 T+2 BACKTEST"
     )
 
     print(
-        "SELL : Day T+2 open"
+        "=" * 65
     )
 
     print(
-        "NEXT BUY : Day T+2 close"
+        f"Period:"
+        f" {START_DATE}"
+        f" -> "
+        f"{END_DATE}"
     )
 
     print(
-        "Capital allocation: 100%"
+        f"Initial capital:"
+        f" ₹{INITIAL_CAPITAL:,.2f}"
     )
 
     print(
-        f"Momentum lookback: "
-        f"{MOMENTUM_LOOKBACK} days"
+        f"Top basket:"
+        f" {TOP_BASKET_SIZE}"
     )
+
+    print(
+        f"Momentum:"
+        f" {MOMENTUM_LOOKBACK} days"
+    )
+
 
     # --------------------------------------------------------
-    # LOAD MEMBERSHIP
+    # MEMBERSHIP
     # --------------------------------------------------------
 
-    membership = load_historical_membership()
+    membership = (
+        load_historical_membership()
+    )
 
-    if membership is None:
-
-        print("\nWARNING")
-
-        print(
-            "Historical NIFTY membership file "
-            "not found."
-        )
-
-        print(
-            "Using fallback 20-stock basket."
-        )
-
-        symbols = FALLBACK_STOCKS
-
-    else:
-
-        symbols = sorted(
-            membership[
-                "symbol"
-            ].unique()
-        )
-
-        print(
-            f"\nHistorical universe loaded: "
-            f"{len(symbols)} symbols"
-        )
 
     # --------------------------------------------------------
-    # DOWNLOAD
+    # SYMBOLS
     # --------------------------------------------------------
 
-    stock_data = download_stock_data(
+    symbols = get_symbols(
+        membership
+    )
+
+    print(
+        f"\nSymbols to process:"
+        f" {len(symbols)}"
+    )
+
+
+    # --------------------------------------------------------
+    # ONE SYMBOL AT A TIME
+    # --------------------------------------------------------
+
+    data = load_all_data(
         symbols
     )
 
-    print(
-        f"\nUsable stocks: "
-        f"{len(stock_data)}"
-    )
 
-    if not stock_data:
+    if not data:
 
         raise RuntimeError(
-            "No stock data downloaded."
+            "No historical data available."
         )
 
+
     # --------------------------------------------------------
-    # RUN BACKTEST
+    # MARKET CALENDAR
     # --------------------------------------------------------
 
-    trades, equity = run_backtest(
-        stock_data,
-        membership
+    calendar = (
+        build_trading_calendar(
+            data
+        )
     )
+
+    print(
+        f"\nTrading days:"
+        f" {len(calendar)}"
+    )
+
+
+    # --------------------------------------------------------
+    # BACKTEST
+    # --------------------------------------------------------
+
+    trades, equity = (
+        run_backtest(
+            data,
+            membership,
+            calendar
+        )
+    )
+
 
     if trades.empty:
 
@@ -1463,45 +2261,55 @@ def main():
             "No trades generated."
         )
 
+
     # --------------------------------------------------------
     # METRICS
     # --------------------------------------------------------
 
-    metrics = calculate_metrics(
-        trades,
-        equity
+    metrics = (
+        calculate_metrics(
+            trades,
+            equity
+        )
     )
 
-    print_metrics(
+
+    # --------------------------------------------------------
+    # REPORT
+    # --------------------------------------------------------
+
+    print_report(
         metrics
     )
+
 
     # --------------------------------------------------------
     # SAMPLE TRADES
     # --------------------------------------------------------
 
-    print("\nFIRST 10 TRADES\n")
-
-    columns = [
-        "entry_date",
-        "exit_date",
-        "symbol",
-        "entry_price",
-        "exit_price",
-        "net_pnl",
-        "net_return",
-        "capital_after"
-    ]
+    print(
+        "\nFirst 10 trades:"
+    )
 
     print(
         trades[
-            columns
+            [
+                "entry_date",
+                "exit_date",
+                "symbol",
+                "entry_price",
+                "exit_price",
+                "net_pnl",
+                "net_return",
+                "capital_after"
+            ]
         ]
         .head(10)
         .to_string(
             index=False
         )
     )
+
 
     # --------------------------------------------------------
     # SAVE
@@ -1513,6 +2321,10 @@ def main():
         metrics
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
